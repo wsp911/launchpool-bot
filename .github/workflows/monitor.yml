@@ -1,0 +1,58 @@
+name: Launchpool Monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+
+  # Позволяет запустить вручную из вкладки Actions
+  # Можно выбрать режим: обычный или тестовый
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска'
+        required: true
+        default: 'monitor'
+        type: choice
+        options:
+          - monitor   # обычный мониторинг
+          - test      # отправить тестовое сообщение
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen announcements cache
+        uses: actions/cache@v4
+        with:
+          path: seen_announcements.json
+          key: seen-announcements-${{ runner.os }}
+          restore-keys: |
+            seen-announcements-
+
+      # Обычный запуск мониторинга (по расписанию или выбор "monitor")
+      - name: Run monitor
+        if: github.event_name == 'schedule' || github.event.inputs.mode == 'monitor'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      # Тестовый запуск — отправляет тестовое сообщение в Telegram
+      - name: Run test
+        if: github.event.inputs.mode == 'test'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py --test
