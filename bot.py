@@ -21,16 +21,11 @@ import requests
 # ══════════════════════════════════════════════
 #  КОНФИГУРАЦИЯ — читается из переменных среды
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")    # токен от @BotFather
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # твой chat_id
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Файл для хранения уже отправленных анонсов (чтобы не дублировать)
 SEEN_FILE = "seen_announcements.json"
 
-# ══════════════════════════════════════════════
-#  КЛЮЧЕВЫЕ СЛОВА ДЛЯ ФИЛЬТРАЦИИ
-#  Binance использует "megadrop" и "hodler airdrops" вместо "launchpool"
-# ══════════════════════════════════════════════
 KEYWORDS = [
     "launchpool",
     "launch pool",
@@ -48,7 +43,6 @@ KEYWORDS = [
 # ══════════════════════════════════════════════
 
 def load_seen() -> set:
-    """Загружает список уже обработанных анонсов из файла."""
     if Path(SEEN_FILE).exists():
         with open(SEEN_FILE) as f:
             return set(json.load(f))
@@ -56,24 +50,20 @@ def load_seen() -> set:
 
 
 def save_seen(seen: set):
-    """Сохраняет список обработанных анонсов в файл."""
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f, indent=2)
 
 
 def make_id(*parts) -> str:
-    """Создаёт уникальный ID анонса из нескольких частей."""
     return hashlib.md5("_".join(str(p) for p in parts).encode()).hexdigest()
 
 
 def is_launchpool(text: str) -> bool:
-    """Проверяет, содержит ли текст ключевые слова Launchpool."""
     text_lower = text.lower()
     return any(kw in text_lower for kw in KEYWORDS)
 
 
 def send_telegram(message: str):
-    """Отправляет сообщение в Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -84,13 +74,12 @@ def send_telegram(message: str):
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"  → Telegram OK")
+        print(f"  -> Telegram OK")
     except Exception as e:
-        print(f"  ✗ Telegram ошибка: {e}")
+        print(f"  Telegram ошибка: {e}")
 
 
 def format_message(ann: dict) -> str:
-    """Форматирует красивое сообщение для Telegram."""
     emoji_map = {
         "Binance": "🟡",
         "Bybit":   "🟠",
@@ -103,7 +92,7 @@ def format_message(ann: dict) -> str:
     return (
         f"{emoji} <b>{ann['exchange']} — Launchpool!</b>\n\n"
         f"📋 {ann['title']}\n\n"
-        f"🔗 <a href='{ann['url']}'>Открыть анонс →</a>\n"
+        f"🔗 <a href='{ann['url']}'>Открыть →</a>\n"
         f"🕐 {now}"
     )
 
@@ -113,10 +102,7 @@ def format_message(ann: dict) -> str:
 # ══════════════════════════════════════════════
 
 def check_bybit() -> list:
-    """
-    Bybit — официальный публичный endpoint.
-    Документация: https://bybit-exchange.github.io/docs/v5/announcement
-    """
+    """Bybit — официальный публичный endpoint анонсов."""
     results = []
     try:
         url    = "https://api.bybit.com/v5/announcements/index"
@@ -147,10 +133,14 @@ def check_bybit() -> list:
 
 def check_bitget() -> list:
     """
-    Bitget — официальный публичный endpoint анонсов.
-    Лимит: 20 запросов/сек на IP — нам хватает с запасом.
+    Bitget — ДВА источника:
+    1. API анонсов — ловит новости с ключевыми словами
+    2. API страницы Launchpool — ловит активные пулы напрямую,
+       даже если анонс ещё не вышел или называется иначе
     """
     results = []
+
+    # --- Источник 1: анонсы ---
     try:
         url    = "https://api.bitget.com/api/v2/public/annc/list"
         params = {"language": "en_US", "size": 20}
@@ -158,12 +148,11 @@ def check_bitget() -> list:
         r.raise_for_status()
         data   = r.json()
 
-        # Структура ответа: data.items[]
         items = data.get("data", {}).get("items", [])
         for item in items:
             title  = item.get("title", "")
             link   = item.get("url", "")
-            ann_id = make_id("bitget", item.get("id", title))
+            ann_id = make_id("bitget_ann", item.get("id", title))
 
             if is_launchpool(title):
                 results.append({
@@ -172,18 +161,50 @@ def check_bitget() -> list:
                     "title":    title,
                     "url":      link,
                 })
-
-        print(f"Bitget: проверено {len(items)} анонсов, найдено {len(results)}")
+        print(f"Bitget анонсы: проверено {len(items)}, найдено {len(results)}")
     except Exception as e:
-        print(f"Bitget ошибка: {e}")
+        print(f"Bitget анонсы ошибка: {e}")
+
+    # --- Источник 2: прямой API активных пулов ---
+    # Новый пул появляется здесь раньше чем выходит анонс!
+    try:
+        url     = "https://api.bitget.com/api/v2/earn/launchpool/list"
+        params  = {"status": "ongoing", "pageSize": 10}
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; LaunchpoolBot/1.0)"}
+        r       = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data    = r.json()
+
+        # API может вернуть data как список или как объект с items
+        raw = data.get("data", [])
+        pools = raw if isinstance(raw, list) else raw.get("items", [])
+
+        for pool in pools:
+            name   = pool.get("coinName") or pool.get("projectName") or pool.get("name", "")
+            pid    = pool.get("projectId") or pool.get("id") or name
+            title  = f"Bitget Launchpool: {name} — новый пул открыт!"
+            link   = "https://www.bitget.com/events/launchpool"
+            ann_id = make_id("bitget_pool", pid)
+
+            if name:
+                results.append({
+                    "id":       ann_id,
+                    "exchange": "Bitget",
+                    "title":    title,
+                    "url":      link,
+                })
+
+        print(f"Bitget пулы: найдено активных {len(pools)}")
+    except Exception as e:
+        print(f"Bitget пулы ошибка: {e}")
+
     return results
 
 
 def check_binance() -> list:
     """
-    Binance — НЕофициальный внутренний endpoint (bapi).
-    ⚠️  Может измениться без предупреждения!
-    Фильтруем расширенным набором слов: megadrop, hodler airdrop и т.д.
+    Binance — неофициальный bapi endpoint.
+    Фильтруем: launchpool, megadrop, hodler airdrop и т.д.
     """
     results = []
     try:
@@ -195,7 +216,6 @@ def check_binance() -> list:
         r.raise_for_status()
         data = r.json()
 
-        # Binance возвращает категории (catalogs), внутри которых статьи (articles)
         catalogs = data.get("data", {}).get("catalogs", [])
         all_articles = []
         for catalog in catalogs:
@@ -222,11 +242,7 @@ def check_binance() -> list:
 
 
 def check_gateio() -> list:
-    """
-    Gate.io — парсим RSS-ленту новостей.
-    У Gate нет стабильного публичного announcements API,
-    поэтому RSS — наиболее надёжный вариант.
-    """
+    """Gate.io — RSS лента новостей."""
     results = []
     try:
         url     = "https://www.gate.io/en/rss/article"
@@ -266,25 +282,17 @@ def check_gateio() -> list:
 # ══════════════════════════════════════════════
 
 def test_mode():
-    """
-    Отправляет тестовое сообщение в Telegram.
-    Запуск: python bot.py --test
-    Используй чтобы проверить что токены правильные и бот доходит до тебя.
-    """
     print(f"\n{'='*50}")
     print(f"ТЕСТОВЫЙ РЕЖИМ | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*50}")
 
-    # Проверяем токены
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID!")
-        print("   Установи переменные среды и попробуй снова.")
+        print("Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID!")
         sys.exit(1)
 
-    print(f"✅ TELEGRAM_TOKEN найден (длина: {len(TELEGRAM_TOKEN)} символов)")
-    print(f"✅ TELEGRAM_CHAT_ID найден: {TELEGRAM_CHAT_ID}")
+    print(f"TELEGRAM_TOKEN найден (длина: {len(TELEGRAM_TOKEN)} символов)")
+    print(f"TELEGRAM_CHAT_ID найден: {TELEGRAM_CHAT_ID}")
 
-    # Сначала проверяем что бот вообще существует (getMe)
     print("\nПроверяю бота через Telegram API...")
     try:
         r = requests.get(
@@ -294,16 +302,15 @@ def test_mode():
         data = r.json()
         if data.get("ok"):
             bot_name = data["result"].get("username", "???")
-            print(f"✅ Бот найден: @{bot_name}")
+            print(f"Бот найден: @{bot_name}")
         else:
-            print(f"❌ Ошибка: {data.get('description', 'неизвестная ошибка')}")
-            print("   Скорее всего токен неправильный. Проверь TELEGRAM_TOKEN.")
+            print(f"Ошибка: {data.get('description', 'неизвестная ошибка')}")
+            print("Скорее всего токен неправильный. Проверь TELEGRAM_TOKEN.")
             sys.exit(1)
     except Exception as e:
-        print(f"❌ Не могу подключиться к Telegram: {e}")
+        print(f"Не могу подключиться к Telegram: {e}")
         sys.exit(1)
 
-    # Отправляем тестовое сообщение — точная копия реального уведомления
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     test_message = (
         f"🧪 <b>Это тестовое сообщение!</b>\n\n"
@@ -330,16 +337,14 @@ def test_mode():
         r = requests.post(url, json=payload, timeout=10)
         data = r.json()
         if data.get("ok"):
-            print("✅ Тестовое сообщение отправлено! Проверь Telegram.")
+            print("Тестовое сообщение отправлено! Проверь Telegram.")
         else:
-            print(f"❌ Ошибка отправки: {data.get('description', '???')}")
-            # Частая ошибка — chat_id неправильный
+            print(f"Ошибка отправки: {data.get('description', '???')}")
             if "chat not found" in str(data).lower():
-                print("   Похоже Chat ID неправильный.")
-                print("   Напиши своему боту /start и попробуй снова.")
+                print("Похоже Chat ID неправильный. Напиши боту /start и попробуй снова.")
             sys.exit(1)
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"Ошибка: {e}")
         sys.exit(1)
 
     print(f"\n{'='*50}")
@@ -356,16 +361,13 @@ def main():
     print(f"Launchpool Monitor | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*50}")
 
-    # Проверяем что токены заданы
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID в переменных среды!")
+        print("Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID!")
         return
 
-    # Загружаем уже отправленные анонсы
     seen = load_seen()
     print(f"Загружено {len(seen)} уже обработанных анонсов\n")
 
-    # Собираем со всех бирж
     all_announcements = []
     all_announcements += check_bybit()
     all_announcements += check_bitget()
@@ -374,25 +376,22 @@ def main():
 
     print(f"\nИтого найдено Launchpool-анонсов: {len(all_announcements)}")
 
-    # Отправляем только новые
     new_count = 0
     for ann in all_announcements:
         if ann["id"] not in seen:
             seen.add(ann["id"])
-            print(f"\n🆕 Новый: [{ann['exchange']}] {ann['title']}")
+            print(f"\nНовый: [{ann['exchange']}] {ann['title']}")
             send_telegram(format_message(ann))
             new_count += 1
         else:
-            print(f"  ⏭  Уже отправлено: {ann['title'][:60]}...")
+            print(f"  Уже отправлено: {ann['title'][:60]}...")
 
-    # Сохраняем обновлённый список
     save_seen(seen)
-    print(f"\n✅ Готово. Новых уведомлений отправлено: {new_count}")
+    print(f"\nГотово. Новых уведомлений отправлено: {new_count}")
     print(f"{'='*50}\n")
 
 
 if __name__ == "__main__":
-    # Если запущен с флагом --test — отправляем тестовое сообщение
     if "--test" in sys.argv:
         test_mode()
     else:
